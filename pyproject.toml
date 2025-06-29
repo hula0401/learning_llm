@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "grpo-qwen"
+version = "0.1.0"
+description = ""
+authors = ["Haozhe Zhang <zhang.hz6666@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+transformers = "^4.52.4"
+datasets = "^3.6.0"
+pandas = "^2.2.0"
+matplotlib = "^3.10.1"
+torch = "2.6.0"
+tensorboard = "2.19.0"
+seaborn = "^0.13.2"
+scipy = "^1.15.3"
+openai = "^1.84.0"
+wandb = "^0.20.1"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
