@@ -134,6 +134,11 @@ class GRPOTrainer:
         self.update_steps = 0 
     def get_tokenizer(self, tokenizer):
         tokenizer.padding_side = "left"
+        # Ensure tokenizer has proper padding token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
         return tokenizer
     
     # 生成样本，以组为单位
@@ -157,9 +162,14 @@ class GRPOTrainer:
             with torch.no_grad():
                 prompt_response_ids = self.model.generate(**inputs.to(self.args.device), 
                                     max_new_tokens = self.args.max_generate_length,
-                                    temperature=0.9,
-                                    top_p = 1,
-                                    top_k = 50)
+                                    temperature=1.2,  # Increased temperature for more diversity
+                                    top_p = 0.8,  # Reduced for more diversity
+                                    top_k = 40,  # Reduced for more diversity
+                                    do_sample=True,  # Explicitly enable sampling
+                                    pad_token_id=self.tokenizer.pad_token_id,
+                                    eos_token_id=self.tokenizer.eos_token_id,
+                                    repetition_penalty=1.2,  # Increased repetition penalty
+                                    no_repeat_ngram_size=3)  # Prevent repetition
                 
             if prompt_response_ids.size(1) >= max_length:
                 prompt_response_ids = prompt_response_ids[:, :max_length]
@@ -249,6 +259,9 @@ class GRPOTrainer:
                         output_reward_func = reward_func(prompts=prompt_texts, responses=response_texts, answers=answers)
                         output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                         rewards_per_func[i] = torch.tensor(output_reward_func, dtype=torch.float32, device=self.args.device)
+                        
+                        # Debug: Print individual reward function outputs
+                        print(f"Reward function {i} outputs: {rewards_per_func[i]}")
                 
                 # rewards_per_func: [num_funcs, num_generations]
                 if not self.args.reward_weights:
@@ -258,11 +271,22 @@ class GRPOTrainer:
                 # 乘以各个奖励函数的权重
                 rewards = rewards_per_func * torch.tensor(self.args.reward_weights, dtype=torch.float32, device=rewards_per_func.device).unsqueeze(1)
                 
+                # Debug: Print weighted rewards
+                print(f"Weighted rewards per function: {rewards}")
+                
                 # rewards: [num_funcs, num_generations]
                 rewards = rewards.sum(dim=0) # shape: [num_generations]
+                
+                # Handle NaN values in rewards
+                rewards = torch.nan_to_num(rewards, nan=0.0, posinf=10.0, neginf=-10.0)
+                
                 print(f'rewards: {rewards}')
                 mean_group_rewards = rewards.mean()
                 std_group_rewards = rewards.std()
+                
+                # Ensure std is not zero to prevent division by zero
+                if std_group_rewards == 0:
+                    std_group_rewards = torch.tensor(1.0, device=rewards.device)
                 
                 # GRPO的优势是句子粒度的，而非token粒度的
                 advantages = (rewards - mean_group_rewards) / (std_group_rewards + 1e-8) # shape: [num_generations]
@@ -298,7 +322,12 @@ class GRPOTrainer:
         advantages = inputs['advantages']
         
         old_action_log_probs = inputs['old_action_log_probs'] if self.args.num_iterations > 1 else action_log_probs.detach()
-        coef_1 = torch.exp(action_log_probs - old_action_log_probs) # 重要性采样 shape: [batch_size * num_generations, num_actions]
+        
+        # Add safety checks for numerical stability
+        log_ratio = action_log_probs - old_action_log_probs
+        log_ratio = torch.clamp(log_ratio, min=-20, max=20)  # Prevent extreme values
+        
+        coef_1 = torch.exp(log_ratio) # 重要性采样 shape: [batch_size * num_generations, num_actions]
         coef_2 = torch.clamp(coef_1, 1 - self.args.clip_eps, 1 + self.args.clip_eps)
         per_token_loss1 = coef_1 * advantages.unsqueeze(1) # 一个序列中每个token的优势是一样的
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
@@ -307,10 +336,17 @@ class GRPOTrainer:
         if self.args.beta != 0.0:
             per_token_loss = per_token_loss + self.args.beta * k3
         
-        loss = per_token_loss.sum(dim=1) / action_mask.sum(dim=1) # shape: [batch_size * num_generations]
+        # Add safety check for division
+        action_mask_sum = action_mask.sum(dim=1)
+        action_mask_sum = torch.clamp(action_mask_sum, min=1)  # Prevent division by zero
+        
+        loss = per_token_loss.sum(dim=1) / action_mask_sum # shape: [batch_size * num_generations]
         loss = loss.mean()
         
-        # loss = per_token_loss.sum() / action_mask.sum()
+        # Check for NaN and replace with 0
+        if torch.isnan(loss):
+            print("Warning: NaN loss detected, replacing with 0")
+            loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
         
         return loss
 
@@ -320,9 +356,17 @@ class GRPOTrainer:
         # 计算策略模型输出token的概率
         output = model(input_ids, attention_mask=attention_mask)
         logits = output.logits
+        
+        # Add safety checks for numerical stability
+        logits = torch.clamp(logits, min=-100, max=100)  # Prevent extreme values
+        
         log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
         log_probs_labels = log_probs.gather(dim=-1, index=input_ids[:, 1:].unsqueeze(-1))
         action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
+        
+        # Additional safety check
+        action_log_probs = torch.clamp(action_log_probs, min=-100, max=100)
+        
         return action_log_probs
 
     

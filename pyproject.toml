@@ -17,6 +17,7 @@ seaborn = "^0.13.2"
 scipy = "^1.15.3"
 openai = "^1.84.0"
 wandb = "^0.20.1"
+accelerate = "^1.8.1"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.29.5"
