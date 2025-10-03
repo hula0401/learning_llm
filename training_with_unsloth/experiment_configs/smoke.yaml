@@ -1,0 +1,25 @@
+remark: smoke
+model_type: qwen3
+model_name: Qwen/Qwen3-4B-Instruct-2507
+
+dataset_name: gsm8k
+max_samples: 2
+dataloader_seed: 0
+
+learning_rate: 5e-6
+batch_size: 1
+num_epochs: 1
+gradient_accumulation_steps: 1
+
+num_generations: 2
+max_prompt_length: 32
+max_generate_length: 32
+temperature: 0.8
+beta: 0.0
+clip_eps: 0.2
+
+load_in_4bit: true
+use_gradient_checkpointing: true
+device_map: auto
+
+use_wandb: false

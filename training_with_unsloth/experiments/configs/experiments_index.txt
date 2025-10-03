@@ -1,0 +1,32 @@
+Experiment Configurations Index
+================================================================================
+
+Total experiments: 5
+
+Experiments:
+
+1. oss20b_grpo_lr1e4
+   Config: oss20b_grpo_lr1e4.yaml
+   LR: 0.0001
+   Output: ./output/oss20b_grpo_lr1e4
+
+2. oss20b_grpo_lr5e5
+   Config: oss20b_grpo_lr5e5.yaml
+   LR: 5e-05
+   Output: ./output/oss20b_grpo_lr5e5
+
+3. oss20b_grpo_lr1e5
+   Config: oss20b_grpo_lr1e5.yaml
+   LR: 1e-05
+   Output: ./output/oss20b_grpo_lr1e5
+
+4. oss20b_grpo_lr5e6
+   Config: oss20b_grpo_lr5e6.yaml
+   LR: 5e-06
+   Output: ./output/oss20b_grpo_lr5e6
+
+5. oss20b_grpo_lr1e6
+   Config: oss20b_grpo_lr1e6.yaml
+   LR: 1e-06
+   Output: ./output/oss20b_grpo_lr1e6
+

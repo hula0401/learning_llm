@@ -1,0 +1,27 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.36.0
+datasets>=2.14.0
+accelerate>=0.24.0
+peft>=0.6.0
+
+# Unsloth for memory-efficient training
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+
+# vLLM for efficient inference (optional but recommended)
+vllm>=0.2.0
+
+# Additional dependencies
+wandb>=0.16.0
+tqdm>=4.65.0
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.10.0
+
+# Memory optimization
+bitsandbytes>=0.41.0
+flash-attn>=2.3.0
+
+# Optional: For better performance
+triton>=2.0.0
+xformers>=0.0.20
