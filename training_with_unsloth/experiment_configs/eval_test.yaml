@@ -1,0 +1,36 @@
+remark: eval_test
+model_type: qwen3
+model_name: Qwen/Qwen3-4B-Instruct-2507
+
+dataset_name: gsm8k
+train_samples: 20
+test_samples: 10
+dataloader_seed: 42
+
+learning_rate: 1e-5
+batch_size: 1
+num_epochs: 50
+gradient_accumulation_steps: 4
+
+num_generations: 4
+max_prompt_length: 256
+max_generate_length: 256
+temperature: 0.7
+eval_temperature: 0.75
+beta: 0.0
+clip_eps: 0.2
+
+load_in_4bit: true
+compute_dtype: bfloat16
+use_flash_attention: true
+use_gradient_checkpointing: true
+device_map: auto
+
+use_wandb: true
+wandb_project: qwen3_4b_grpo
+
+output_dir: /home/hula0401/learning_llm/training_with_unsloth/output/eval_test
+logs_dir: /home/hula0401/learning_llm/training_with_unsloth/logs/eval_test
+
+random_seed: 42
+

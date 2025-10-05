@@ -21,6 +21,8 @@ class ExperimentConfig:
     dataset_name: str = "gsm8k"
     dataset_path: Optional[str] = None
     max_samples: int = 50
+    train_samples: Optional[int] = None  # For train/test split
+    test_samples: Optional[int] = None   # For train/test split
     dataloader_seed: int = 42
 
     # Training
@@ -34,6 +36,7 @@ class ExperimentConfig:
     max_prompt_length: int = 512
     max_generate_length: int = 512
     temperature: float = 0.7
+    eval_temperature: float = 0.75  # Temperature for evaluation sampling (Pass@5/10)
     beta: float = 0.1
     clip_eps: float = 0.2
 

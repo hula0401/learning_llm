@@ -1,0 +1,231 @@
+# WandB Logging Standards for GRPO Training
+
+## Overview
+This document defines the standard logging metrics for WandB in GRPO training experiments.
+
+## Metric Categories
+
+### 1. Training Metrics (logged every step)
+- `grpo_loss` - GRPO policy loss value
+- `step` - Training step number (updates counter)
+
+### 2. Reward Metrics (logged during training)
+- `rewards/mean` - Mean reward across all generations in the current batch
+- `rewards/std` - Standard deviation of rewards in the current batch
+- `rewards/max` - Maximum reward in the current batch
+- `rewards/min` - Minimum reward in the current batch
+
+### 3. Evaluation Metrics (logged every epoch)
+- `eval/correctness@5` - Pass@5: Probability that at least one of top-5 generations is correct
+- `eval/correctness@10` - Pass@10: Probability that at least one of top-10 generations is correct
+- `eval/pass@1` - Pass@1: Probability that the first generation is correct (accuracy)
+- `epoch` - Current epoch number
+
+### 4. Sample Logging (logged periodically)
+- `sample/prompt` - Example prompt from training
+- `sample/response` - Example response from model
+- `sample/answer` - Ground truth answer
+
+## Metric Definitions
+
+### Pass@k (Correctness@k)
+**Definition:** The probability that at least one of the top-k generated responses is correct.
+
+**Formula:**
+```
+pass@k = (number of prompts with at least 1 correct answer in top-k) / (total number of prompts)
+```
+
+**Example:**
+- Generate 10 responses per prompt
+- If any of the top-5 responses matches the ground truth → count as success for pass@5
+- If any of the top-10 responses matches the ground truth → count as success for pass@10
+
+**Implementation:**
+```python
+def evaluate(eval_dataset, num_samples_per_prompt=10):
+    correct_at_5 = 0
+    correct_at_10 = 0
+    total = 0
+    
+    for item in eval_dataset:
+        # Generate num_samples_per_prompt responses
+        responses = generate(item['prompt'], n=num_samples_per_prompt)
+        
+        # Extract and normalize answers
+        extracted = [extract_answer(r) for r in responses]
+        
+        # Check if any of top-k match ground truth
+        correct_in_5 = any(ans == item['answer'] for ans in extracted[:5])
+        correct_in_10 = any(ans == item['answer'] for ans in extracted[:10])
+        
+        if correct_in_5:
+            correct_at_5 += 1
+        if correct_in_10:
+            correct_at_10 += 1
+        total += 1
+    
+    return {
+        'eval/correctness@5': correct_at_5 / total,
+        'eval/correctness@10': correct_at_10 / total
+    }
+```
+
+### Pass@1 (Accuracy)
+**Definition:** The probability that the first (or best) generated response is correct.
+
+**Formula:**
+```
+pass@1 = (number of prompts with correct first response) / (total number of prompts)
+```
+
+**Note:** Pass@1 is equivalent to standard accuracy when using greedy decoding or evaluating only the top-1 response.
+
+### Reward Statistics
+**Mean Reward:** Average reward across all generations in a batch
+- Indicates overall quality of generated responses
+- Should increase over training as model learns to maximize rewards
+
+**Reward Std:** Standard deviation of rewards in a batch
+- High std means diverse response quality (some very good, some very bad)
+- Low std means consistent response quality
+- In GRPO, rewards are normalized per group using mean and std
+
+## WandB Logging Code Examples
+
+### During Training
+```python
+# Log training loss
+wandb.log({
+    "grpo_loss": loss.item(),
+    "step": self.update_steps
+})
+
+# Log reward statistics
+wandb.log({
+    "rewards/mean": rewards.mean().item(),
+    "rewards/std": rewards.std().item(),
+    "rewards/max": rewards.max().item(),
+    "rewards/min": rewards.min().item(),
+})
+
+# Log sample
+wandb.log({
+    "sample/prompt": prompt,
+    "sample/response": response,
+    "sample/answer": ground_truth
+})
+```
+
+### During Evaluation
+```python
+# Evaluate and log metrics
+eval_metrics = trainer.evaluate(test_dataset, num_samples_per_prompt=10)
+
+wandb.log({
+    "eval/correctness@5": eval_metrics['correctness@5'],
+    "eval/correctness@10": eval_metrics['correctness@10'],
+    "eval/pass@1": eval_metrics.get('pass@1', 0.0),
+    "epoch": current_epoch
+})
+```
+
+## Run Naming Convention
+
+Format: `{model_type}_grpo_train{N}_test{M}_lr{lr}_ep{epochs}_{remark}`
+
+Example: `qwen3_grpo_train20_test10_lr1e-5_ep3_rmk`
+
+Components:
+- `model_type`: Model family (e.g., qwen3, llama3)
+- `train{N}`: Number of training samples
+- `test{M}`: Number of test/eval samples
+- `lr{lr}`: Learning rate in scientific notation
+- `ep{epochs}`: Number of epochs
+- `remark`: Custom identifier for the experiment
+
+## Config Logging
+
+Always log the full experiment config to WandB:
+
+```python
+wandb.init(
+    project=cfg.wandb_project,
+    name=run_name,
+    config=cfg.to_dict(),  # Log entire config
+    reinit=True
+)
+```
+
+## Best Practices
+
+1. **Consistent Naming:** Always use the defined metric names for compatibility across experiments
+2. **Log Frequency:** 
+   - Training loss: Every gradient update
+   - Rewards: Every batch
+   - Evaluation: Every epoch
+3. **Units:** Keep metrics in [0, 1] range when possible (use rates/probabilities)
+4. **Reproducibility:** Always log random seed and dataset split configuration
+5. **Checkpoints:** Save model when eval metrics reach new highs
+
+## Monitoring Dashboard
+
+Recommended WandB dashboard panels:
+
+1. **Training Progress**
+   - Line plot: `grpo_loss` vs `step`
+   - Line plot: `rewards/mean` vs `step`
+
+2. **Reward Distribution**
+   - Line plot: `rewards/mean` ± `rewards/std` vs `step`
+   - Line plot: `rewards/max` and `rewards/min` vs `step`
+
+3. **Evaluation Performance**
+   - Line plot: `eval/correctness@5` and `eval/correctness@10` vs `epoch`
+   - Line plot: `eval/pass@1` vs `epoch`
+
+4. **Sample Inspection**
+   - Table: Recent `sample/prompt`, `sample/response`, `sample/answer`
+
+## Example Experiment Tracking
+
+```python
+# Initialize
+run = wandb.init(
+    project="grpo-qwen3-experiments",
+    name="qwen3_grpo_train50_test10_lr1e-5_ep10_baseline",
+    config={
+        "model": "Qwen/Qwen3-4B-Instruct-2507",
+        "train_samples": 50,
+        "test_samples": 10,
+        "learning_rate": 1e-5,
+        "num_epochs": 10,
+        "num_generations": 4,
+    }
+)
+
+# Training loop
+for epoch in range(num_epochs):
+    for batch in train_loader:
+        # Train
+        loss, rewards = trainer.train_step(batch)
+        
+        # Log
+        wandb.log({
+            "grpo_loss": loss,
+            "rewards/mean": rewards.mean(),
+            "rewards/std": rewards.std(),
+            "step": step
+        })
+    
+    # Evaluate
+    metrics = trainer.evaluate(test_dataset)
+    wandb.log({
+        **metrics,  # eval/correctness@5, eval/correctness@10
+        "epoch": epoch
+    })
+
+# Finish
+wandb.finish()
+```
+

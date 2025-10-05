@@ -1,0 +1,374 @@
+# Cursor Rules for WandB Logging in GRPO Training
+
+## Standard Metrics to Log
+
+### 1. Training Loss
+**Metric**: `grpo_loss`
+- **Type**: Scalar (float)
+- **Frequency**: Every training step
+- **Description**: GRPO policy optimization loss value
+- **Code Example**:
+```python
+import time
+wandb.log({
+    "grpo_loss": loss.item(),
+    "step": self.update_steps,
+    "timestamp": time.time()  # Unix timestamp
+})
+```
+
+### 2. Reward Statistics
+Log all reward statistics during training to monitor model improvement:
+
+**Metric**: `rewards/mean`
+- **Type**: Scalar (float)
+- **Frequency**: Every batch/generation
+- **Description**: Mean reward across all generations in current batch
+- **Interpretation**: Should increase over training as model learns
+
+**Metric**: `rewards/std`
+- **Type**: Scalar (float)
+- **Frequency**: Every batch/generation
+- **Description**: Standard deviation of rewards in current batch
+- **Interpretation**: High std = diverse quality, low std = consistent quality
+
+**Metric**: `rewards/max`
+- **Type**: Scalar (float)
+- **Frequency**: Every batch/generation
+- **Description**: Maximum reward in current batch
+
+**Metric**: `rewards/min`
+- **Type**: Scalar (float)
+- **Frequency**: Every batch/generation
+- **Description**: Minimum reward in current batch
+
+**Code Example**:
+```python
+import time
+wandb.log({
+    "rewards/mean": rewards.mean().item(),
+    "rewards/std": rewards.std().item(),
+    "rewards/max": rewards.max().item(),
+    "rewards/min": rewards.min().item(),
+    "timestamp": time.time()
+})
+```
+
+### 3. Evaluation Metrics (Pass@K)
+
+**Metric**: `eval/pass@1`
+- **Type**: Scalar (float in [0, 1])
+- **Frequency**: Every epoch
+- **Description**: Accuracy using greedy decoding (temperature=0, deterministic)
+- **Formula**: `correct_answers / total_questions`
+- **Generation**: Single deterministic answer per prompt (do_sample=False, temperature=0)
+- **Also known as**: Accuracy, Greedy accuracy
+
+**Metric**: `eval/pass@5`
+- **Type**: Scalar (float in [0, 1])
+- **Frequency**: Every epoch
+- **Description**: Probability that at least 1 of 5 sampled responses is correct
+- **Formula**: `(prompts with ≥1 correct in 5 samples) / total_prompts`
+- **Generation**: Sample 5 responses per prompt with temperature > 0
+
+**Metric**: `eval/pass@10`
+- **Type**: Scalar (float in [0, 1])
+- **Frequency**: Every epoch
+- **Description**: Probability that at least 1 of 10 sampled responses is correct
+- **Formula**: `(prompts with ≥1 correct in 10 samples) / total_prompts`
+- **Generation**: Sample 10 responses per prompt with temperature > 0
+
+**Code Example**:
+```python
+import time
+
+# Evaluate and log
+eval_metrics = trainer.evaluate(
+    test_dataset, 
+    num_samples_per_prompt=10,
+    eval_temperature=0.75  # Temperature for Pass@5/10 sampling
+)
+wandb.log({
+    "eval/pass@1": eval_metrics['pass@1'],    # Greedy decoding
+    "eval/pass@5": eval_metrics['pass@5'],    # 5 samples with T=0.75
+    "eval/pass@10": eval_metrics['pass@10'],  # 10 samples with T=0.75
+    "epoch": current_epoch,
+    "timestamp": time.time()
+})
+```
+
+### 4. Sample Inspection
+**Metrics**: `sample/prompt`, `sample/response`, `sample/answer`
+- **Type**: Text
+- **Frequency**: Periodically (e.g., every batch)
+- **Description**: Example prompt/response/answer for qualitative inspection
+
+**Code Example**:
+```python
+import time
+wandb.log({
+    "sample/prompt": prompt_text,
+    "sample/response": model_response,
+    "sample/answer": ground_truth_answer,
+    "timestamp": time.time()
+})
+```
+
+## Pass@K Definition and Implementation
+
+### What is Pass@K?
+Pass@K measures the success rate when generating K attempts per problem.
+
+### Mathematical Definitions
+
+**Pass@1 (Accuracy)**:
+```
+Pass@1 = (# correct greedy answers) / (# total questions)
+```
+- Uses **greedy decoding** (temperature=0, deterministic)
+- Single best answer per question
+- Standard accuracy metric
+
+**Pass@K (K > 1)**:
+```
+Pass@K = P(at least 1 correct answer in K samples)
+       = (# prompts with ≥1 correct in K samples) / (# total prompts)
+```
+- Uses **sampling** with temperature > 0
+- Generate K diverse responses per question
+- Success if ANY of the K responses is correct
+
+### Key Differences
+- **Pass@1**: Greedy, deterministic, measures single-attempt accuracy
+- **Pass@5/10**: Stochastic sampling, measures success with multiple attempts
+- **Relationship**: Pass@1 ≤ Pass@5 ≤ Pass@10 ≤ ... (monotonically increasing)
+- **Interpretation**: Pass@K shows how often the model can solve problems given K tries
+
+### Implementation Example
+```python
+def evaluate_pass_at_k(model, dataset, eval_temperature=0.75):
+    """
+    Evaluate Pass@K metrics correctly.
+    
+    Args:
+        model: Language model
+        dataset: Test dataset with 'prompt' and 'answer' fields
+        eval_temperature: Temperature for Pass@5/10 sampling (not used for Pass@1)
+    
+    Returns:
+        dict: {'pass@1': 0.85, 'pass@5': 0.92, 'pass@10': 0.95}
+    """
+    correct_pass_1 = 0
+    correct_pass_5 = 0
+    correct_pass_10 = 0
+    total = 0
+    
+    for item in dataset:
+        ground_truth = normalize_number(item['answer'])
+        total += 1
+        
+        # 1. Pass@1: Greedy decoding
+        greedy_response = model.generate(
+            item['prompt'], 
+            temperature=0.0,  # Greedy
+            do_sample=False   # Deterministic
+        )
+        greedy_answer = normalize_number(extract_answer(greedy_response))
+        if greedy_answer == ground_truth:
+            correct_pass_1 += 1
+        
+        # 2. Pass@5/10: Sample with temperature
+        sampled_responses = model.generate(
+            item['prompt'],
+            temperature=eval_temperature,  # e.g., 0.75
+            do_sample=True,
+            num_return_sequences=10
+        )
+        sampled_answers = [normalize_number(extract_answer(r)) for r in sampled_responses]
+        
+        # Pass@5: Any of first 5 correct?
+        if any(ans == ground_truth for ans in sampled_answers[:5]):
+            correct_pass_5 += 1
+        
+        # Pass@10: Any of all 10 correct?
+        if any(ans == ground_truth for ans in sampled_answers[:10]):
+            correct_pass_10 += 1
+    
+    return {
+        'eval/pass@1': correct_pass_1 / total,
+        'eval/pass@5': correct_pass_5 / total,
+        'eval/pass@10': correct_pass_10 / total
+    }
+```
+
+## WandB Project and Run Naming
+
+### Project Name Convention
+Format: `{model_family}_{model_size}_{method}`
+
+Examples:
+- `qwen3_4b_grpo`
+- `llama3_8b_grpo`
+- `mistral_7b_dpo`
+
+### Run Name Convention
+Format: `{model_type}_grpo_train{N}_test{M}_lr{lr}_ep{epochs}_{remark}`
+
+Examples:
+- `qwen3_grpo_train20_test10_lr1e-5_ep3_eval_test`
+- `qwen3_grpo_bs1_lr1e-5_ng4_ga4_seed42_rmk`
+
+Components:
+- `model_type`: Model family (qwen3, llama3, etc.)
+- `train{N}`: Number of training samples
+- `test{M}`: Number of test samples
+- `lr{lr}`: Learning rate in scientific notation
+- `ep{epochs}`: Number of epochs
+- `bs{N}`: Batch size
+- `ng{N}`: Number of generations
+- `ga{N}`: Gradient accumulation steps
+- `seed{N}`: Random seed
+- `remark`: Custom identifier
+
+## Initialization Template
+
+```python
+import wandb
+from training_with_unsloth.framework.config import ExperimentConfig
+
+# Load config
+cfg = ExperimentConfig.from_yaml("config.yaml")
+
+# Initialize WandB
+lr_str = f"{float(cfg.learning_rate):.0e}".replace("e-0", "e-")
+run_name = f"{cfg.model_type}_grpo_train{cfg.train_samples}_test{cfg.test_samples}_lr{lr_str}_ep{cfg.num_epochs}_{cfg.remark}"
+
+wandb.init(
+    project=cfg.wandb_project,  # e.g., "qwen3_4b_grpo"
+    name=run_name,
+    config=cfg.to_dict(),  # Log entire config
+    reinit=True
+)
+
+# Training loop
+for epoch in range(cfg.num_epochs):
+    for batch in train_loader:
+        # Train step
+        loss, rewards = trainer.train_step(batch)
+        
+        # Log training metrics
+        wandb.log({
+            "grpo_loss": loss.item(),
+            "rewards/mean": rewards.mean().item(),
+            "rewards/std": rewards.std().item(),
+            "rewards/max": rewards.max().item(),
+            "rewards/min": rewards.min().item(),
+            "step": step
+        })
+    
+    # Evaluate at end of epoch
+    eval_metrics = trainer.evaluate(test_dataset, num_samples_per_prompt=10)
+    wandb.log({
+        "eval/pass@1": eval_metrics['pass@1'],
+        "eval/correctness@5": eval_metrics['correctness@5'],
+        "eval/correctness@10": eval_metrics['correctness@10'],
+        "epoch": epoch + 1
+    })
+
+# Finish
+wandb.finish()
+```
+
+## Best Practices
+
+1. **Always Log Config**: Include full experiment config in `wandb.init(config=...)`
+2. **Consistent Naming**: Use standardized metric names for cross-experiment comparison
+3. **Defensive Logging**: Wrap `wandb.log()` in try-except when WandB might be disabled:
+   ```python
+   try:
+       wandb.log({"metric": value})
+   except Exception:
+       pass
+   ```
+4. **Metric Ranges**: Keep metrics in [0, 1] when possible (use rates/probabilities)
+5. **Step Counter**: Always log `step` with training metrics for proper x-axis
+6. **Epoch Counter**: Always log `epoch` with evaluation metrics
+7. **Save Config**: Save resolved config to output directory for reproducibility
+
+## Monitoring Dashboard Panels
+
+Recommended WandB dashboard setup:
+
+1. **Training Progress**
+   - Line: `grpo_loss` vs `step`
+   - Line: `rewards/mean` vs `step` (with std band)
+
+2. **Reward Distribution**
+   - Line: `rewards/max`, `rewards/mean`, `rewards/min` vs `step`
+   - Line: `rewards/std` vs `step`
+
+3. **Evaluation Performance**
+   - Line: `eval/pass@1`, `eval/correctness@5`, `eval/correctness@10` vs `epoch`
+   - Bar: Final Pass@K values
+
+4. **Sample Inspection**
+   - Table: `sample/prompt`, `sample/response`, `sample/answer`
+
+## Error Handling
+
+```python
+# Check if WandB is initialized
+if cfg.use_wandb:
+    try:
+        wandb.log(metrics)
+    except Exception as e:
+        print(f"WandB logging failed: {e}")
+        pass
+```
+
+## Example Complete Script
+
+```python
+def main():
+    # Load config
+    cfg = ExperimentConfig.from_yaml(args.config)
+    
+    # Initialize WandB with proper naming
+    if cfg.use_wandb:
+        lr_str = f"{float(cfg.learning_rate):.0e}".replace("e-0", "e-")
+        run_name = f"{cfg.model_type}_grpo_train{cfg.train_samples}_test{cfg.test_samples}_lr{lr_str}_ep{cfg.num_epochs}_{cfg.remark}"
+        wandb.init(
+            project="qwen3_4b_grpo",
+            name=run_name,
+            config=cfg.to_dict()
+        )
+    
+    # Training
+    trainer = GRPOTrainer(model, args, train_dataset, eval_dataset, tokenizer)
+    trainer.train()  # Automatically logs metrics
+    
+    # Cleanup
+    if cfg.use_wandb:
+        wandb.finish()
+```
+
+## Summary of Required Metrics
+
+| Metric | Type | Frequency | Range | Description |
+|--------|------|-----------|-------|-------------|
+| `grpo_loss` | float | per step | [0, ∞) | Training loss |
+| `rewards/mean` | float | per batch | [-∞, ∞) | Mean reward |
+| `rewards/std` | float | per batch | [0, ∞) | Reward std dev |
+| `rewards/max` | float | per batch | [-∞, ∞) | Max reward |
+| `rewards/min` | float | per batch | [-∞, ∞) | Min reward |
+| `eval/pass@1` | float | per epoch | [0, 1] | Greedy accuracy |
+| `eval/pass@5` | float | per epoch | [0, 1] | Pass@5 (≥1 in 5 samples) |
+| `eval/pass@10` | float | per epoch | [0, 1] | Pass@10 (≥1 in 10 samples) |
+| `step` | int | per step | [0, ∞) | Training step |
+| `epoch` | int | per epoch | [1, N] | Epoch number |
+| `timestamp` | float | all logs | [0, ∞) | Unix timestamp (time.time()) |
+
+---
+
+Follow these standards for all GRPO training experiments to ensure consistency and comparability across runs.
+

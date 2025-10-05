@@ -14,6 +14,7 @@ import os
 import platform
 import wandb
 import re
+import time
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
@@ -84,6 +85,7 @@ class GRPOArguments:
     gradient_accumulation_steps = 2 # 梯度累加
     num_iterations = 1 # 采样一次样本训练模型轮数
     batch_size = 1
+    eval_temperature = 0.75 # Temperature for evaluation Pass@5/10 sampling
 
 class GRPOTrainer:
     def __init__(self,
@@ -267,9 +269,6 @@ class GRPOTrainer:
         batch_old_action_log_probs = []
         batch_ref_action_log_probs = []
         
-        # Track accumulated rewards for logging
-        accumulated_rewards = []
-        
         for samples in samples_list:
             prompt_response_ids = samples.prompt_response_ids # shape: (num_generations, seq_len)
             response_ids = samples.response_ids # shape: (num_generations, seq_len)
@@ -306,7 +305,8 @@ class GRPOTrainer:
                     wandb.log({
                         "sample/prompt": prompt_texts[0],
                         "sample/response": response_texts[0],
-                        "sample/answer": answers[0]
+                        "sample/answer": answers[0],
+                        "timestamp": time.time()
                     })
                 except Exception:
                     pass
@@ -314,6 +314,12 @@ class GRPOTrainer:
                 for i, (reward_func, reward_tokenizer) in enumerate(
                     zip(self.reward_funcs, self.reward_tokenizers)
                 ):
+                    # Get reward function name
+                    if isinstance(reward_func, PreTrainedModel):
+                        func_name = f"model_{i}"
+                    else:
+                        func_name = getattr(reward_func, '__name__', f'func_{i}')
+                    
                     if isinstance(reward_func, PreTrainedModel):
                         with torch.inference_mode():
                             reward_model_inputs = reward_tokenizer(prompt_response_texts, return_tensors="pt", padding=True)
@@ -325,8 +331,8 @@ class GRPOTrainer:
                         output_reward_func = [reward if reward is not None else torch.nan for reward in output_reward_func]
                         rewards_per_func[i] = torch.tensor(output_reward_func, dtype=torch.float32, device=self.args.device)
                         
-                        # Debug: Print individual reward function outputs
-                        print(f"Reward function {i} outputs: {rewards_per_func[i]}")
+                        # Debug: Print individual reward function outputs with name
+                        print(f"Reward '{func_name}': {rewards_per_func[i]}")
                 
                 # rewards_per_func: [num_funcs, num_generations]
                 if not self.args.reward_weights:
@@ -357,9 +363,6 @@ class GRPOTrainer:
                 advantages = (rewards - mean_group_rewards) / (std_group_rewards + 1e-8) # shape: [num_generations]
                 batch_advantages.append(advantages)
                 
-                # Accumulate rewards for this group
-                accumulated_rewards.append(rewards)
-                
                 # Log rewards for this group
                 try:
                     wandb.log({
@@ -367,23 +370,10 @@ class GRPOTrainer:
                         "rewards/std": std_group_rewards.item(),
                         "rewards/max": rewards.max().item(),
                         "rewards/min": rewards.min().item(),
+                        "timestamp": time.time()
                     })
                 except Exception:
                     pass
-        
-        # Calculate and log accumulated reward normalized by num_generations
-        if accumulated_rewards:
-            all_rewards = torch.cat(accumulated_rewards, dim=0)  # Concatenate all rewards
-            accumulated_reward = all_rewards.sum().item()
-            normalized_accumulated_reward = accumulated_reward / len(all_rewards)
-            
-            try:
-                wandb.log({
-                    "rewards/accumulated": accumulated_reward,
-                    "rewards/accumulated_normalized": normalized_accumulated_reward,
-                })
-            except Exception:
-                pass
                
         return {
             "prompt_response_ids": torch.cat(batch_prompt_response_ids, dim=0),
@@ -496,6 +486,153 @@ class GRPOTrainer:
 
     
     
+    def evaluate(self, eval_dataset, num_samples_per_prompt=10, eval_temperature=0.75, verbose=True):
+        """
+        Evaluate the model on a test set with Pass@K metrics.
+        
+        Pass@K Definition:
+        - Pass@1: Greedy decoding (temperature=0, deterministic best answer)
+                  Accuracy = # correct answers / # total questions
+        - Pass@5: Sample 5 responses per prompt, success if ANY are correct
+                  Pass@5 = # prompts with ≥1 correct in 5 samples / # total prompts
+        - Pass@10: Sample 10 responses per prompt, success if ANY are correct
+                   Pass@10 = # prompts with ≥1 correct in 10 samples / # total prompts
+        
+        Args:
+            eval_dataset: Dataset with 'prompt' and 'answer' fields
+            num_samples_per_prompt: Number of responses to generate per prompt (for Pass@5/10)
+            eval_temperature: Temperature for sampling (used for Pass@5/10, not Pass@1)
+            verbose: If True, print detailed results for each question
+        
+        Returns:
+            Dictionary with pass@1, pass@5, pass@10 metrics
+        """
+        from training_with_unsloth.rewards.reward_functions import extract_answer, normalize_number
+        
+        self.model.eval()
+        correct_pass_at_1 = 0  # Greedy decoding
+        correct_pass_at_5 = 0  # At least 1 correct in 5 samples
+        correct_pass_at_10 = 0  # At least 1 correct in 10 samples
+        total_prompts = 0
+        
+        # Store results for detailed logging
+        eval_results = []
+        
+        with torch.no_grad():
+            for q_idx, item in enumerate(eval_dataset):
+                prompt = item['prompt']
+                answer = item['answer']
+                total_prompts += 1
+                norm_gt = normalize_number(str(answer))
+                
+                if verbose:
+                    print(f"\n{'='*80}")
+                    print(f"Question {q_idx + 1}/{len(eval_dataset)}")
+                    print(f"{'='*80}")
+                    print(f"Prompt: {prompt[:200]}..." if len(prompt) > 200 else f"Prompt: {prompt}")
+                    print(f"Ground Truth Answer: {answer}")
+                    print(f"-" * 80)
+                
+                # 1. Pass@1: Generate with greedy decoding (temperature=0)
+                input_text = self.tokenizer.apply_chat_template(
+                    [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt}
+                    ],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+                inputs = self.tokenizer(input_text, return_tensors="pt", padding=True)
+                
+                # Greedy generation for Pass@1
+                gen_kwargs = {
+                    "max_new_tokens": self.args.max_generate_length,
+                    "temperature": 0.0,  # Greedy
+                    "do_sample": False,  # Deterministic
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                }
+                
+                greedy_output = self.model.generate(**inputs.to(self.args.device), **gen_kwargs)
+                greedy_response = self.tokenizer.decode(greedy_output[0], skip_special_tokens=True)
+                greedy_answer = extract_answer(greedy_response)
+                norm_greedy = normalize_number(greedy_answer)
+                
+                greedy_correct = norm_greedy == norm_gt
+                if greedy_correct:
+                    correct_pass_at_1 += 1
+                
+                if verbose:
+                    print(f"Pass@1 (Greedy, temp=0.0):")
+                    print(f"  Raw: {greedy_response[:150]}..." if len(greedy_response) > 150 else f"  Raw: {greedy_response}")
+                    print(f"  Extracted: '{greedy_answer}' → Normalized: '{norm_greedy}'")
+                    print(f"  ✓ CORRECT" if greedy_correct else f"  ✗ WRONG (expected '{norm_gt}')")
+                    print(f"-" * 80)
+                
+                # 2. Pass@5 and Pass@10: Generate with sampling
+                gen_kwargs_sample = {
+                    "max_new_tokens": self.args.max_generate_length,
+                    "temperature": eval_temperature,
+                    "top_p": 0.9,
+                    "do_sample": True,
+                    "num_return_sequences": num_samples_per_prompt,
+                    "pad_token_id": self.tokenizer.pad_token_id,
+                    "eos_token_id": self.tokenizer.eos_token_id,
+                }
+                
+                sampled_outputs = self.model.generate(**inputs.to(self.args.device), **gen_kwargs_sample)
+                sampled_responses = self.tokenizer.batch_decode(sampled_outputs, skip_special_tokens=True)
+                
+                # Extract and normalize all sampled answers
+                sampled_answers = [extract_answer(r) for r in sampled_responses]
+                norm_sampled = [normalize_number(a) for a in sampled_answers]
+                
+                # Check Pass@5: at least 1 correct in first 5 samples
+                pass5_correct = any(ans == norm_gt for ans in norm_sampled[:5])
+                if pass5_correct:
+                    correct_pass_at_5 += 1
+                
+                # Check Pass@10: at least 1 correct in all 10 samples
+                pass10_correct = any(ans == norm_gt for ans in norm_sampled[:10])
+                if pass10_correct:
+                    correct_pass_at_10 += 1
+                
+                if verbose:
+                    print(f"Pass@5/10 Samples (temp={eval_temperature}):")
+                    for i, (ans_raw, ans_norm) in enumerate(zip(sampled_answers, norm_sampled), 1):
+                        is_correct = ans_norm == norm_gt
+                        marker = "✓" if is_correct else "✗"
+                        print(f"  Sample {i:2d}: '{ans_norm}' {marker}")
+                    
+                    correct_in_5 = sum(1 for ans in norm_sampled[:5] if ans == norm_gt)
+                    correct_in_10 = sum(1 for ans in norm_sampled[:10] if ans == norm_gt)
+                    print(f"-" * 80)
+                    print(f"Summary for Q{q_idx + 1}:")
+                    print(f"  Pass@1:  {marker if greedy_correct else '✗'} (greedy)")
+                    print(f"  Pass@5:  {'✓' if pass5_correct else '✗'} ({correct_in_5}/5 correct)")
+                    print(f"  Pass@10: {'✓' if pass10_correct else '✗'} ({correct_in_10}/10 correct)")
+                
+                # Store result
+                eval_results.append({
+                    'question': prompt,
+                    'ground_truth': norm_gt,
+                    'greedy_answer': norm_greedy,
+                    'greedy_correct': greedy_correct,
+                    'sampled_answers': norm_sampled,
+                    'pass5_correct': pass5_correct,
+                    'pass10_correct': pass10_correct
+                })
+        
+        metrics = {
+            'pass@1': correct_pass_at_1 / total_prompts if total_prompts > 0 else 0.0,
+            'pass@5': correct_pass_at_5 / total_prompts if total_prompts > 0 else 0.0,
+            'pass@10': correct_pass_at_10 / total_prompts if total_prompts > 0 else 0.0,
+            'eval_samples': total_prompts,
+            'detailed_results': eval_results
+        }
+        
+        return metrics
+    
     def train_step(self, model, inputs, optimizer, step):
         model.train()
         loss = self.compute_loss(model, inputs)
@@ -505,7 +642,11 @@ class GRPOTrainer:
             optimizer.step()
             optimizer.zero_grad()
             try:
-                wandb.log({"grpo_loss": loss.item(), "step": self.update_steps})
+                wandb.log({
+                    "grpo_loss": loss.item(), 
+                    "step": self.update_steps,
+                    "timestamp": time.time()
+                })
             except Exception:
                 pass
             print(f"step: {self.update_steps}/{self.global_steps}  grpo_loss: {loss.item():.8f}")
@@ -513,12 +654,32 @@ class GRPOTrainer:
 
     def train(self):
         self.global_steps = self.args.num_iterations * self.args.epoch * len(self.train_dataset) // (self.args.batch_size * self.args.gradient_accumulation_steps)
-        for _ in range(self.args.epoch):
+        
+        # Baseline evaluation before training
+        if self.eval_dataset is not None:
+            print(f"\n{'#'*80}")
+            print(f"# BASELINE EVALUATION (Before Training - Epoch 0)")
+            print(f"{'#'*80}")
+            eval_temperature = getattr(self.args, 'eval_temperature', 0.75)
+            baseline_metrics = self.evaluate(self.eval_dataset, num_samples_per_prompt=10, eval_temperature=eval_temperature, verbose=True)
+            print(f"\n{'='*80}")
+            print(f"BASELINE RESULTS:")
+            print(f"  Pass@1:  {baseline_metrics['pass@1']:.4f}")
+            print(f"  Pass@5:  {baseline_metrics['pass@5']:.4f}")
+            print(f"  Pass@10: {baseline_metrics['pass@10']:.4f}")
+            print(f"{'='*80}\n")
+        
+        for epoch in range(self.args.epoch):
+            # Track accumulated rewards for this epoch
+            epoch_total_rewards = []
             
             dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=True)
             for idx, batch in enumerate(dataloader):
                 
                 inputs = self.generate_experiences(batch)
+                # Track rewards from this batch
+                if 'rewards' in inputs:
+                    epoch_total_rewards.extend(inputs['rewards'].cpu().tolist())
                 self.input_buffer[idx % self.args.gradient_accumulation_steps] = inputs
                 if (idx + 1) % self.args.gradient_accumulation_steps == 0:
                    
@@ -532,6 +693,50 @@ class GRPOTrainer:
                             self.tokenizer.save_pretrained(self.args.output_dir + f'/checkpoint_{self.update_steps}')
                         
                 del inputs
+            
+            # Compute accumulated reward for this epoch
+            if epoch_total_rewards:
+                epoch_mean_reward = sum(epoch_total_rewards) / len(epoch_total_rewards)
+                epoch_accumulated_reward = sum(epoch_total_rewards)
+                print(f"\n=== Epoch {epoch + 1}/{self.args.epoch} Summary ===")
+                print(f"Accumulated Reward: {epoch_accumulated_reward:.4f}")
+                print(f"Mean Reward: {epoch_mean_reward:.4f}")
+                print(f"Total Samples: {len(epoch_total_rewards)}")
+            else:
+                epoch_mean_reward = 0.0
+                epoch_accumulated_reward = 0.0
+            
+            # Evaluate at the end of each epoch
+            if self.eval_dataset is not None:
+                print(f"\n{'#'*80}")
+                print(f"# EVALUATION - End of Epoch {epoch + 1}/{self.args.epoch}")
+                print(f"{'#'*80}")
+                eval_temperature = getattr(self.args, 'eval_temperature', 0.75)
+                # Verbose for first 3 epochs and every 10 epochs, otherwise summary only
+                verbose_eval = (epoch < 3) or ((epoch + 1) % 10 == 0)
+                eval_metrics = self.evaluate(self.eval_dataset, num_samples_per_prompt=10, eval_temperature=eval_temperature, verbose=verbose_eval)
+                
+                print(f"\n{'='*80}")
+                print(f"EPOCH {epoch + 1} RESULTS:")
+                print(f"  Pass@1:  {eval_metrics['pass@1']:.4f}")
+                print(f"  Pass@5:  {eval_metrics['pass@5']:.4f}")
+                print(f"  Pass@10: {eval_metrics['pass@10']:.4f}")
+                print(f"  Accumulated Reward: {epoch_accumulated_reward:.4f}")
+                print(f"  Mean Reward: {epoch_mean_reward:.4f}")
+                print(f"{'='*80}\n")
+                
+                try:
+                    wandb.log({
+                        "eval/pass@1": eval_metrics['pass@1'],
+                        "eval/pass@5": eval_metrics['pass@5'],
+                        "eval/pass@10": eval_metrics['pass@10'],
+                        "epoch/accumulated_reward": epoch_accumulated_reward,
+                        "epoch/mean_reward": epoch_mean_reward,
+                        "epoch": epoch + 1,
+                        "timestamp": time.time()
+                    })
+                except Exception:
+                    pass
     def save_model(self):
         self.model.save_pretrained(self.args.output_dir)
         self.tokenizer.save_pretrained(self.args.output_dir)
